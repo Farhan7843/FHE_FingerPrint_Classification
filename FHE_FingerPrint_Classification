@@ -1,0 +1,244 @@
+import os
+import re
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, random_split
+import torchvision.transforms as T
+import timm
+import kornia
+from sklearn.metrics import accuracy_score, f1_score, recall_score, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print("Using device:", DEVICE)
+
+DATA_DIRS = [
+    os.path.expanduser("~/data/SOCOFing/Real"),
+    os.path.expanduser("~/data/SOCOFing/Altered/Altered-Easy"),
+    os.path.expanduser("~/data/SOCOFing/Altered/Altered-Medium"),
+    os.path.expanduser("~/data/SOCOFing/Altered/Altered-Hard"),
+]
+
+BATCH_SIZE = 32
+NUM_WORKERS = 4
+IMG_SIZE = 224
+NUM_CLASSES = 5
+EPOCHS = 50
+LR_HEAD = 1e-3
+LR_BACKBONE = 1e-5
+FREEZE_EPOCHS = 3
+PATIENCE = 3
+
+FINGER_ORDER = ["thumb", "index", "middle", "ring", "little"]
+FINGER_MAP = {i: name for i, name in enumerate(FINGER_ORDER)}
+
+class FingerprintDataset(Dataset):
+    def __init__(self, roots, transform=None):
+        if isinstance(roots, str):
+            roots = [roots]
+        self.paths, self.labels = [], []
+        exts = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+        pat = re.compile(r"(thumb|index|middle|ring|little)", re.IGNORECASE)
+        for root in roots:
+            if not os.path.isdir(root): continue
+            for fn in sorted(os.listdir(root)):
+                ext = os.path.splitext(fn)[1].lower()
+                if ext in exts:
+                    m = pat.search(fn)
+                    if m:
+                        idx = FINGER_ORDER.index(m.group(1).lower())
+                        self.paths.append(os.path.join(root, fn))
+                        self.labels.append(idx)
+        if not self.paths:
+            raise RuntimeError(f"No images found in {roots}")
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, i):
+        img = Image.open(self.paths[i]).convert("RGB")
+        arr = np.array(img)
+        if self.transform:
+            arr = self.transform(arr)
+        return arr, self.labels[i]
+
+train_transform = T.Compose([
+    T.ToPILImage(),
+    T.Resize((IMG_SIZE, IMG_SIZE)),
+    T.RandAugment(num_ops=2, magnitude=9),
+    T.ToTensor(),
+    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+val_transform = T.Compose([
+    T.ToPILImage(),
+    T.Resize((IMG_SIZE, IMG_SIZE)),
+    T.ToTensor(),
+    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+def make_loaders():
+    ds = FingerprintDataset(DATA_DIRS, transform=None)
+    n = len(ds)
+    n_train = int(0.70 * n)
+    n_val = int(0.15 * n)
+    n_test = n - n_train - n_val
+    train_ds, val_ds, test_ds = random_split(ds, [n_train, n_val, n_test])
+    train_ds.dataset.transform = train_transform
+    val_ds.dataset.transform = val_transform
+    test_ds.dataset.transform = val_transform
+
+    train_labels = [ds.labels[i] for i in train_ds.indices]
+    counts = np.bincount(train_labels, minlength=NUM_CLASSES)
+    weights = 1.0 / counts
+    sample_w = [weights[l] for l in train_labels]
+    sampler = WeightedRandomSampler(sample_w, num_samples=len(sample_w), replacement=True)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler,
+                              num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=NUM_WORKERS, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
+                             num_workers=NUM_WORKERS, pin_memory=True)
+    return train_loader, val_loader, test_loader
+
+train_loader, val_loader, test_loader = make_loaders()
+print(f"Train: {len(train_loader.dataset)}, Val: {len(val_loader.dataset)}, Test: {len(test_loader.dataset)}")
+
+class EfficientNetModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = timm.create_model(
+            "efficientnet_b0", pretrained=True, num_classes=0, global_pool="avg"
+        )
+        feat_dim = self.backbone.num_features + 2
+        self.head = nn.Sequential(
+            nn.Linear(feat_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, NUM_CLASSES)
+        )
+
+    def forward(self, x):
+        f = self.backbone(x)
+        gray = kornia.color.rgb_to_grayscale(x)
+        blur = kornia.filters.gaussian_blur2d(gray, (5, 5), (1.0, 1.0))
+        edges = kornia.filters.sobel(blur)
+        emap = torch.sqrt((edges ** 2).sum(dim=1, keepdim=True))
+        mv = emap.view(emap.size(0), -1)
+        stats = torch.cat([mv.mean(1, keepdim=True), mv.std(1, keepdim=True)], dim=1)
+        return self.head(torch.cat([f, stats], dim=1))
+
+model = EfficientNetModel().to(DEVICE)
+for p in model.backbone.parameters():
+    p.requires_grad = False
+
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+opt_head = optim.AdamW(model.head.parameters(), lr=LR_HEAD)
+opt_all = None
+scaler = torch.amp.GradScaler()
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt_head, "max", patience=PATIENCE)
+
+best_f1, no_imp = 0.0, 0
+
+for ep in range(1, EPOCHS + 1):
+    print(f"\nEpoch {ep}/{EPOCHS}")
+    if ep == FREEZE_EPOCHS + 1:
+        for p in model.backbone.parameters():
+            p.requires_grad = True
+        opt_all = optim.AdamW(model.parameters(), lr=LR_BACKBONE)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt_all, "max", patience=PATIENCE)
+
+    model.train()
+    tot = corr = 0
+    opt = opt_head if ep <= FREEZE_EPOCHS else opt_all
+    for imgs, labs in train_loader:
+        imgs, labs = imgs.to(DEVICE), labs.to(DEVICE)
+        opt.zero_grad()
+        with torch.amp.autocast(device_type="cuda"):
+            outs = model(imgs)
+            loss = criterion(outs, labs)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+        preds = outs.argmax(1)
+        corr += (preds == labs).sum().item()
+        tot += labs.size(0)
+    print(f"  Train Acc: {corr / tot:.4f}")
+
+    model.eval()
+    y_t, y_p = [], []
+    with torch.no_grad():
+        for imgs, labs in val_loader:
+            imgs = imgs.to(DEVICE)
+            outs = model(imgs)
+            preds = outs.argmax(1).cpu().numpy()
+            y_p.extend(preds)
+            y_t.extend(labs.cpu().numpy())
+    f1 = f1_score(y_t, y_p, average="macro")
+    rec = recall_score(y_t, y_p, average="macro")
+    print(f"  Val F1: {f1:.4f}, Recall: {rec:.4f}")
+    scheduler.step(f1)
+
+    if f1 > best_f1:
+        best_f1, no_imp = f1, 0
+        torch.save(model.state_dict(), "best_efficientnet.pth")
+    else:
+        no_imp += 1
+        if no_imp > PATIENCE:
+            print("Early stopping.")
+            break
+
+model.load_state_dict(torch.load("best_efficientnet.pth", map_location=DEVICE))
+model.eval()
+y_t, y_p = [], []
+with torch.no_grad():
+    for imgs, labs in test_loader:
+        imgs = imgs.to(DEVICE)
+        outs = model(imgs)
+        preds = outs.argmax(1).cpu().numpy()
+        y_p.extend(preds)
+        y_t.extend(labs.cpu().numpy())
+
+acc = accuracy_score(y_t, y_p)
+f1 = f1_score(y_t, y_p, average="macro")
+rec = recall_score(y_t, y_p, average="macro")
+print(f"\nTest Acc: {acc:.4f}, F1: {f1:.4f}, Recall: {rec:.4f}")
+
+cm = confusion_matrix(y_t, y_p)
+cmn = cm.astype(float) / cm.sum(axis=1)[:, None]
+plt.figure(figsize=(6, 5))
+sns.heatmap(cmn, annot=True, fmt=".2f",
+            xticklabels=FINGER_ORDER, yticklabels=FINGER_ORDER,
+            cmap="Blues")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.title("Test Confusion Matrix")
+plt.show()
+
+def visualize_prediction(path, model, threshold=0.5):
+    img = Image.open(path).convert("RGB")
+    arr = np.array(img)
+    inp = val_transform(arr).unsqueeze(0).to(DEVICE)
+    with torch.no_grad(), torch.amp.autocast(device_type="cuda"):
+        outs = model(inp)
+        probs = torch.softmax(outs, 1).cpu().numpy()[0]
+    idx = int(np.argmax(probs))
+    conf = probs[idx]
+    plt.figure(figsize=(6, 3))
+    plt.subplot(1, 2, 1)
+    plt.imshow(arr)
+    plt.title(f"{FINGER_MAP[idx]} ({conf * 100:.1f}%)")
+    plt.axis("off")
+    plt.subplot(1, 2, 2)
+    sns.barplot(x=FINGER_ORDER, y=probs, palette="magma")
+    plt.ylim(0, 1)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+    return FINGER_MAP[idx], conf
